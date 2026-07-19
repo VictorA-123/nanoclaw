@@ -72,83 +72,179 @@ async function inspectContainerIp(
   return null;
 }
 
-// --- Phase 3 pillar 1: definition-fetch, SHADOW MODE (observe-only) ---
-// Explicit group.folder -> kernel agent-id map. Only mapped groups are shadowed;
-// unmapped groups are skipped silently. This map does NOT influence how any
-// agent actually spawns — it only names which kernel definition to observe.
-const SHADOW_AGENT_IDS: Record<string, string> = {
+// --- Phase 3 pillar 1: definition-fetch — REAL (kernel-primary, cache fallback) ---
+// Explicit group.folder -> kernel agent-id map. Only mapped groups are driven by
+// the kernel definition; unmapped groups always use the legacy-local path.
+const AGENT_IDS: Record<string, string> = {
   whatsapp_main: 'agent:jammer',
   whatsapp_builder: 'agent:haddock',
 };
 const KERNEL_URL = process.env.KERNEL_URL || 'http://127.0.0.1:4100';
 const DEFINITION_CACHE_DIR = path.join(process.cwd(), 'cache', 'definitions');
-const SHADOW_FETCH_TIMEOUT_MS = 2500;
+const DEFINITION_FETCH_TIMEOUT_MS = 2500;
+
+type SpawnSource = 'kernel' | 'cache-fallback' | 'legacy-local';
+
+interface ResolvedDefinition {
+  source: SpawnSource;
+  // Absolute path to mount as /workspace/group (the context-bearing folder).
+  groupFolderPath: string;
+  // Kernel/cache-recorded context path, for the registry-vs-reality log (null for legacy).
+  contextPath: string | null;
+}
+
+// Extract the nanoclaw_group runtime's absolute group_folder from a definition.
+// Returns null if absent/malformed (bad JSON is swallowed).
+function extractGroupFolder(definition: any): string | null {
+  const runtimes = Array.isArray(definition?.runtimes) ? definition.runtimes : [];
+  for (const rt of runtimes) {
+    if (rt?.runtime_type !== 'nanoclaw_group') continue;
+    try {
+      const cfg = JSON.parse(rt?.config ?? '{}');
+      if (typeof cfg?.group_folder === 'string' && cfg.group_folder.length > 0) {
+        return cfg.group_folder;
+      }
+    } catch {
+      // malformed runtime config — treat as no folder
+    }
+  }
+  return null;
+}
+
+function extractContextPath(definition: any): string | null {
+  const c = definition?.context_version?.content;
+  return typeof c === 'string' && c.length > 0 ? c : null;
+}
+
+// A definition is only usable to drive a spawn if it names a group folder that
+// actually exists as a directory on this host.
+function usableGroupDir(folder: string | null): folder is string {
+  if (!folder) return false;
+  try {
+    return fs.statSync(folder).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 /**
- * SHADOW MODE (observe-only): fetch an agent's kernel definition at spawn,
- * cache it as last-known-good, and log a comparison of the kernel's recorded
- * context path vs. the context file the agent actually spawns with. Purely
- * additive observation — it NEVER blocks, NEVER throws, and NEVER alters the
- * spawn path. Any error (kernel down, timeout, non-OK, bad JSON) is logged and
- * swallowed so the spawn continues exactly as today. Call fire-and-forget.
+ * Resolve which definition drives this spawn, kernel-primary with a strict
+ * three-tier fallback that ALWAYS ends in a usable group folder:
+ *   1. kernel  — GET /agents/<id>/definition (hard ~2.5s timeout). On success
+ *      with a usable group_folder, drive from it AND refresh the cache.
+ *   2. cache-fallback — the last-known-good cache/definitions/<id>.json, if it
+ *      parses and names a usable group_folder.
+ *   3. legacy-local — resolveGroupFolderPath(group.folder), i.e. exactly today's
+ *      behavior. Unmapped groups and every failure land here.
+ * This function never throws; the caller also guards it. The kernel-vs-local
+ * comparison is logged by the caller from the returned contextPath.
  */
-async function shadowFetchDefinition(group: RegisteredGroup): Promise<void> {
-  try {
-    const agentId = SHADOW_AGENT_IDS[group.folder];
-    if (!agentId) {
-      logger.debug(
-        { group: group.folder },
-        'Shadow definition-fetch: no agent-id mapping, skipping',
-      );
-      return;
-    }
+async function resolveSpawnDefinition(
+  group: RegisteredGroup,
+): Promise<ResolvedDefinition> {
+  const legacyFolder = resolveGroupFolderPath(group.folder);
+  const agentId = AGENT_IDS[group.folder];
 
-    // GET the composed definition with a hard timeout; never let it hang a spawn.
-    const url = `${KERNEL_URL}/agents/${agentId}/definition`;
+  // Unmapped groups have no kernel identity — behave exactly as today.
+  if (!agentId) {
+    return {
+      source: 'legacy-local',
+      groupFolderPath: legacyFolder,
+      contextPath: null,
+    };
+  }
+
+  // Tier 1: kernel (bounded by a hard timeout so a slow/hung kernel can't stall).
+  let kernelDef: any = null;
+  try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SHADOW_FETCH_TIMEOUT_MS);
-    let definition: any;
+    const timer = setTimeout(
+      () => controller.abort(),
+      DEFINITION_FETCH_TIMEOUT_MS,
+    );
     try {
-      const res = await fetch(url, { signal: controller.signal });
-      if (!res.ok) {
+      const res = await fetch(`${KERNEL_URL}/agents/${agentId}/definition`, {
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        kernelDef = await res.json();
+      } else {
         logger.warn(
           { agentId, status: res.status },
-          'Shadow definition-fetch: non-OK response — continuing spawn unaffected',
+          'definition-fetch: kernel returned non-OK — trying cache',
         );
-        return;
       }
-      definition = await res.json();
     } finally {
       clearTimeout(timer);
     }
-
-    // Cache last-known-good (overwrite).
-    fs.mkdirSync(DEFINITION_CACHE_DIR, { recursive: true });
-    fs.writeFileSync(
-      path.join(DEFINITION_CACHE_DIR, `${agentId}.json`),
-      JSON.stringify(definition, null, 2) + '\n',
+  } catch (err) {
+    logger.warn(
+      { agentId, err },
+      'definition-fetch: kernel unreachable/timeout — trying cache',
     );
+  }
 
-    // The comparison is the entire point of shadow mode: does the kernel's
-    // recorded context_version path match the context file the agent actually
-    // spawns with right now (its group's dashboard-context.md)?
-    const kernelPath: string | null =
-      definition?.context_version?.content ?? null;
-    const localPath = path.join(
-      resolveGroupFolderPath(group.folder),
-      'dashboard-context.md',
+  if (kernelDef) {
+    const folder = extractGroupFolder(kernelDef);
+    if (usableGroupDir(folder)) {
+      // Refresh last-known-good cache (best-effort; failure never blocks spawn).
+      try {
+        fs.mkdirSync(DEFINITION_CACHE_DIR, { recursive: true });
+        fs.writeFileSync(
+          path.join(DEFINITION_CACHE_DIR, `${agentId}.json`),
+          JSON.stringify(kernelDef, null, 2) + '\n',
+        );
+      } catch (err) {
+        logger.warn(
+          { agentId, err },
+          'definition-fetch: cache refresh failed (continuing spawn from kernel)',
+        );
+      }
+      return {
+        source: 'kernel',
+        groupFolderPath: folder,
+        contextPath: extractContextPath(kernelDef),
+      };
+    }
+    logger.warn(
+      { agentId },
+      'definition-fetch: kernel definition unusable (no valid group_folder) — trying cache',
     );
-    const match = kernelPath === localPath;
-    logger.info(
-      { agentId, fetch: 'ok', kernel: kernelPath, local: localPath, match },
-      `Shadow definition-fetch: ${agentId} fetch=ok kernel: ${kernelPath} / local: ${localPath} / match: ${match}`,
+  }
+
+  // Tier 2: cached last-known-good.
+  try {
+    const cached = JSON.parse(
+      fs.readFileSync(
+        path.join(DEFINITION_CACHE_DIR, `${agentId}.json`),
+        'utf8',
+      ),
+    );
+    const folder = extractGroupFolder(cached);
+    if (usableGroupDir(folder)) {
+      return {
+        source: 'cache-fallback',
+        groupFolderPath: folder,
+        contextPath: extractContextPath(cached),
+      };
+    }
+    logger.warn(
+      { agentId },
+      'definition-fetch: cached definition unusable — using legacy-local',
     );
   } catch (err) {
     logger.warn(
-      { group: group.folder, err },
-      'Shadow definition-fetch failed — continuing spawn unaffected',
+      { agentId, err },
+      'definition-fetch: no usable cache — using legacy-local',
     );
   }
+
+  // Tier 3: legacy-local — never worse than today; folder is created by the caller.
+  return {
+    source: 'legacy-local',
+    groupFolderPath: legacyFolder,
+    contextPath: null,
+  };
 }
 
 export interface ContainerInput {
@@ -177,10 +273,13 @@ interface VolumeMount {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  groupDir: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
-  const groupDir = resolveGroupFolderPath(group.folder);
+  // groupDir (the /workspace/group source) is resolved by the caller from the
+  // effective definition (kernel/cache) or the legacy path. Sessions, IPC, and
+  // agent-runner mounts below stay keyed on the stable group.folder.
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
@@ -399,13 +498,47 @@ export async function runContainerAgent(
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
-  const groupDir = resolveGroupFolderPath(group.folder);
+  // Phase 3 pillar 1 (REAL): the spawn's group folder / context is now sourced
+  // from the kernel definition (kernel-primary), with cache and legacy-local
+  // fallback. Outer guard: any unexpected failure in resolution falls back to
+  // the legacy path so a spawn can NEVER hard-fail because of definition-fetch.
+  let resolved: ResolvedDefinition;
+  try {
+    resolved = await resolveSpawnDefinition(group);
+  } catch (err) {
+    logger.warn(
+      { group: group.folder, err },
+      'definition-fetch: resolver threw — falling back to legacy-local',
+    );
+    resolved = {
+      source: 'legacy-local',
+      groupFolderPath: resolveGroupFolderPath(group.folder),
+      contextPath: null,
+    };
+  }
+
+  const groupDir = resolved.groupFolderPath;
   fs.mkdirSync(groupDir, { recursive: true });
   // Container runs as node user (uid 1000); host may be root. Ensure the
   // group workspace is world-writable so the container can write files.
   fs.chmodSync(groupDir, 0o777);
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  // Log which tier drove this spawn, plus the registry-vs-reality comparison
+  // (kernel-recorded context path vs. the dashboard-context.md we mount).
+  const localContext = path.join(groupDir, 'dashboard-context.md');
+  logger.info(
+    {
+      group: group.name,
+      agentId: AGENT_IDS[group.folder] ?? null,
+      spawnSource: resolved.source,
+      kernel: resolved.contextPath,
+      local: localContext,
+      match: resolved.contextPath === localContext,
+    },
+    `Definition-driven spawn — source: ${resolved.source} / kernel: ${resolved.contextPath} / local: ${localContext} / match: ${resolved.contextPath === localContext}`,
+  );
+
+  const mounts = buildVolumeMounts(group, input.isMain, groupDir);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
@@ -432,11 +565,6 @@ export async function runContainerAgent(
     },
     'Spawning container agent',
   );
-
-  // SHADOW MODE (Phase 3 pillar 1): observe the kernel's agent definition and
-  // compare it to what we actually spawn with. Fire-and-forget — deliberately
-  // not awaited; the helper swallows all errors and never affects the spawn.
-  void shadowFetchDefinition(group);
 
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
