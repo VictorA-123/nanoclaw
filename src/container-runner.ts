@@ -72,6 +72,85 @@ async function inspectContainerIp(
   return null;
 }
 
+// --- Phase 3 pillar 1: definition-fetch, SHADOW MODE (observe-only) ---
+// Explicit group.folder -> kernel agent-id map. Only mapped groups are shadowed;
+// unmapped groups are skipped silently. This map does NOT influence how any
+// agent actually spawns — it only names which kernel definition to observe.
+const SHADOW_AGENT_IDS: Record<string, string> = {
+  whatsapp_main: 'agent:jammer',
+  whatsapp_builder: 'agent:haddock',
+};
+const KERNEL_URL = process.env.KERNEL_URL || 'http://127.0.0.1:4100';
+const DEFINITION_CACHE_DIR = path.join(process.cwd(), 'cache', 'definitions');
+const SHADOW_FETCH_TIMEOUT_MS = 2500;
+
+/**
+ * SHADOW MODE (observe-only): fetch an agent's kernel definition at spawn,
+ * cache it as last-known-good, and log a comparison of the kernel's recorded
+ * context path vs. the context file the agent actually spawns with. Purely
+ * additive observation — it NEVER blocks, NEVER throws, and NEVER alters the
+ * spawn path. Any error (kernel down, timeout, non-OK, bad JSON) is logged and
+ * swallowed so the spawn continues exactly as today. Call fire-and-forget.
+ */
+async function shadowFetchDefinition(group: RegisteredGroup): Promise<void> {
+  try {
+    const agentId = SHADOW_AGENT_IDS[group.folder];
+    if (!agentId) {
+      logger.debug(
+        { group: group.folder },
+        'Shadow definition-fetch: no agent-id mapping, skipping',
+      );
+      return;
+    }
+
+    // GET the composed definition with a hard timeout; never let it hang a spawn.
+    const url = `${KERNEL_URL}/agents/${agentId}/definition`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SHADOW_FETCH_TIMEOUT_MS);
+    let definition: any;
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) {
+        logger.warn(
+          { agentId, status: res.status },
+          'Shadow definition-fetch: non-OK response — continuing spawn unaffected',
+        );
+        return;
+      }
+      definition = await res.json();
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // Cache last-known-good (overwrite).
+    fs.mkdirSync(DEFINITION_CACHE_DIR, { recursive: true });
+    fs.writeFileSync(
+      path.join(DEFINITION_CACHE_DIR, `${agentId}.json`),
+      JSON.stringify(definition, null, 2) + '\n',
+    );
+
+    // The comparison is the entire point of shadow mode: does the kernel's
+    // recorded context_version path match the context file the agent actually
+    // spawns with right now (its group's dashboard-context.md)?
+    const kernelPath: string | null =
+      definition?.context_version?.content ?? null;
+    const localPath = path.join(
+      resolveGroupFolderPath(group.folder),
+      'dashboard-context.md',
+    );
+    const match = kernelPath === localPath;
+    logger.info(
+      { agentId, fetch: 'ok', kernel: kernelPath, local: localPath, match },
+      `Shadow definition-fetch: ${agentId} fetch=ok kernel: ${kernelPath} / local: ${localPath} / match: ${match}`,
+    );
+  } catch (err) {
+    logger.warn(
+      { group: group.folder, err },
+      'Shadow definition-fetch failed — continuing spawn unaffected',
+    );
+  }
+}
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -353,6 +432,11 @@ export async function runContainerAgent(
     },
     'Spawning container agent',
   );
+
+  // SHADOW MODE (Phase 3 pillar 1): observe the kernel's agent definition and
+  // compare it to what we actually spawn with. Fire-and-forget — deliberately
+  // not awaited; the helper swallows all errors and never affects the spawn.
+  void shadowFetchDefinition(group);
 
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
