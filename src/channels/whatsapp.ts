@@ -252,10 +252,14 @@ export class WhatsAppChannel implements Channel {
     // to distinguish bot output from user messages.
     // Skip if the agent already included its own label (e.g. "Jammer: ..." or "Haddock: ...").
     const alreadyPrefixed = /^[A-Za-z][A-Za-z0-9 ]*:/.test(text);
+    // Stamp the group's own configured assistant name; fall back to the global
+    // ASSISTANT_NAME only when the jid isn't a registered group (e.g. a DM).
+    const assistantName =
+      this.opts.registeredGroups()[jid]?.assistantName || ASSISTANT_NAME;
     const prefixed =
       ASSISTANT_HAS_OWN_NUMBER || alreadyPrefixed
         ? text
-        : `${ASSISTANT_NAME}: ${text}`;
+        : `${assistantName}: ${text}`;
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text: prefixed });
