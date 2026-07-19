@@ -31,6 +31,7 @@ import {
   registerContainer,
 } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
+import { emitRunStarted, emitEvent } from './kernel-events.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -96,12 +97,17 @@ interface ResolvedDefinition {
 // Extract the nanoclaw_group runtime's absolute group_folder from a definition.
 // Returns null if absent/malformed (bad JSON is swallowed).
 function extractGroupFolder(definition: any): string | null {
-  const runtimes = Array.isArray(definition?.runtimes) ? definition.runtimes : [];
+  const runtimes = Array.isArray(definition?.runtimes)
+    ? definition.runtimes
+    : [];
   for (const rt of runtimes) {
     if (rt?.runtime_type !== 'nanoclaw_group') continue;
     try {
       const cfg = JSON.parse(rt?.config ?? '{}');
-      if (typeof cfg?.group_folder === 'string' && cfg.group_folder.length > 0) {
+      if (
+        typeof cfg?.group_folder === 'string' &&
+        cfg.group_folder.length > 0
+      ) {
         return cfg.group_folder;
       }
     } catch {
@@ -569,6 +575,33 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
+  // Pillar 2 (event emission) — REPORTING ONLY. Open a kernel run for this fresh
+  // spawn and report its lifecycle (run_started / message_in / message_out /
+  // run_ended). Fire-and-forget: emitRunStarted() is NOT awaited, every emit is
+  // chained off runIdPromise without blocking, and all failures are swallowed —
+  // if the kernel is down, events are dropped and the spawn/reply are unaffected.
+  // Only mapped agents (which have a kernel identity) are reported; reuses
+  // AGENT_IDS, the same mapping the definition-fetch cutover uses.
+  const emitAgentId = AGENT_IDS[group.folder];
+  const runIdPromise: Promise<string | null> = emitAgentId
+    ? emitRunStarted(emitAgentId, {
+        channel: 'whatsapp',
+        invoked_by: input.chatJid,
+      })
+    : Promise.resolve(null);
+  if (emitAgentId) {
+    runIdPromise
+      .then((runId) => {
+        if (!runId) return;
+        void emitEvent(runId, 'run_started', undefined, {
+          chatJid: input.chatJid,
+          isMain: input.isMain,
+        });
+        void emitEvent(runId, 'message_in', input.prompt);
+      })
+      .catch(() => {});
+  }
+
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -651,6 +684,17 @@ export async function runContainerAgent(
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
             outputChain = outputChain.then(() => onOutput(parsed));
+
+            // Report the reply to the kernel (fire-and-forget; never blocks or
+            // affects delivery). Skipped for null/empty results.
+            if (emitAgentId && parsed.result) {
+              const reply = parsed.result;
+              runIdPromise
+                .then((runId) => {
+                  if (runId) void emitEvent(runId, 'message_out', reply);
+                })
+                .catch(() => {});
+            }
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -722,6 +766,20 @@ export async function runContainerAgent(
         registeredIp = null;
       }
       const duration = Date.now() - startTime;
+
+      // Report run end to the kernel (fire-and-forget; never blocks the close).
+      // NOTE: this records a `run_ended` EVENT; the kernel has no run-completion
+      // endpoint yet, so the runs row stays status:'started' — see the known
+      // kernel-side gap documented in kernel-events.ts.
+      if (emitAgentId) {
+        runIdPromise
+          .then((runId) => {
+            if (runId) {
+              void emitEvent(runId, 'run_ended', undefined, { exitCode: code });
+            }
+          })
+          .catch(() => {});
+      }
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
