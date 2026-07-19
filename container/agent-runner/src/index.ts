@@ -392,6 +392,11 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      // Per-agent model pin: Jammer (whatsapp_main, isMain) runs Sonnet 4.6 for
+      // fast, token-light personal chat; Haddock (builder) runs Opus 4.8 for
+      // agentic coding/research. Pro-subscription auth, so this trades against
+      // usage limits, not per-token billing.
+      model: containerInput.isMain ? 'claude-sonnet-4-6' : 'claude-opus-4-8',
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,

@@ -78,7 +78,7 @@ export class WhatsAppChannel implements Channel {
       },
       printQRInTerminal: false,
       logger,
-      browser: Browsers.macOS('Chrome'),
+      browser: Browsers.macOS('Agent'),
     });
 
     this.sock.ev.on('connection.update', (update) => {
@@ -219,11 +219,11 @@ export class WhatsAppChannel implements Channel {
             const fromMe = msg.key.fromMe || false;
             // Detect bot messages: with own number, fromMe is reliable
             // since only the bot sends from that number.
-            // With shared number, bot messages carry the assistant name prefix
-            // (even in DMs/self-chat) so we check for that.
+            // With shared number, bot messages carry an agent label prefix
+            // (e.g. "Jammer:", "Jammer Finances:", "Haddock:") so we check for that.
             const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
               ? fromMe
-              : content.startsWith(`${ASSISTANT_NAME}:`);
+              : /^[A-Za-z][A-Za-z0-9 ]*:/.test(content);
 
             this.opts.onMessage(chatJid, {
               id: msg.key.id || '',
@@ -250,10 +250,12 @@ export class WhatsAppChannel implements Channel {
     // Prefix bot messages with assistant name so users know who's speaking.
     // On a shared number, prefix is also needed in DMs (including self-chat)
     // to distinguish bot output from user messages.
-    // Skip only when the assistant has its own dedicated phone number.
-    const prefixed = ASSISTANT_HAS_OWN_NUMBER
-      ? text
-      : `${ASSISTANT_NAME}: ${text}`;
+    // Skip if the agent already included its own label (e.g. "Jammer: ..." or "Haddock: ...").
+    const alreadyPrefixed = /^[A-Za-z][A-Za-z0-9 ]*:/.test(text);
+    const prefixed =
+      ASSISTANT_HAS_OWN_NUMBER || alreadyPrefixed
+        ? text
+        : `${ASSISTANT_NAME}: ${text}`;
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text: prefixed });

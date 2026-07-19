@@ -75,7 +75,7 @@ async function connectSocket(
     },
     printQRInTerminal: false,
     logger,
-    browser: Browsers.macOS('Chrome'),
+    browser: Browsers.macOS('Agent'),
   });
 
   if (usePairingCode && phoneNumber && !state.creds.me) {

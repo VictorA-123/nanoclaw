@@ -40,7 +40,7 @@ export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
 export const CONTAINER_TIMEOUT = parseInt(
-  process.env.CONTAINER_TIMEOUT || '1800000',
+  process.env.CONTAINER_TIMEOUT || '3600000', // 1 hour — enough for scraper runs and multi-step code changes
   10,
 );
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(

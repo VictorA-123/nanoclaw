@@ -27,6 +27,7 @@ import {
   PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
+  deleteSession,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -272,6 +273,7 @@ async function runAgent(
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
+  const agentName = group.assistantName || ASSISTANT_NAME;
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -309,21 +311,64 @@ async function runAgent(
       }
     : undefined;
 
-  try {
-    const output = await runContainerAgent(
+  const runWithSession = async (
+    sid: string | undefined,
+  ): Promise<ContainerOutput> => {
+    return runContainerAgent(
       group,
       {
         prompt,
-        sessionId,
+        sessionId: sid,
         groupFolder: group.folder,
         chatJid,
         isMain,
-        assistantName: ASSISTANT_NAME,
+        assistantName: agentName,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
     );
+  };
+
+  const clearSession = () => {
+    delete sessions[group.folder];
+    deleteSession(group.folder);
+  };
+
+  const isStaleSession = (err?: string) =>
+    !!err &&
+    (err.includes('No conversation found with session ID') ||
+      err.includes('conversation not found'));
+
+  const isTimedOutNoOutput = (err?: string) =>
+    !!err && err.includes('Container timed out') && !err.includes('(idle)');
+
+  try {
+    let output = await runWithSession(sessionId);
+
+    // Stale session ID: clear and retry immediately with a fresh session
+    if (
+      output.status === 'error' &&
+      sessionId &&
+      isStaleSession(output.error)
+    ) {
+      logger.warn(
+        { group: group.name, sessionId },
+        'Stale session ID detected, clearing and retrying with fresh session',
+      );
+      clearSession();
+      output = await runWithSession(undefined);
+    }
+    // Timeout with no output: container got stuck — kill was already handled by
+    // container-runner, so just clear the session and retry fresh
+    else if (output.status === 'error' && isTimedOutNoOutput(output.error)) {
+      logger.warn(
+        { group: group.name, sessionId },
+        'Container timed out with no output, clearing session and retrying',
+      );
+      clearSession();
+      output = await runWithSession(undefined);
+    }
 
     if (output.newSessionId) {
       sessions[group.folder] = output.newSessionId;

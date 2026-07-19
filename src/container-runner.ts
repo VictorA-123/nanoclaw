@@ -25,13 +25,52 @@ import {
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { detectAuthMode } from './credential-proxy.js';
+import {
+  deregisterContainer,
+  detectAuthMode,
+  registerContainer,
+} from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+/**
+ * Resolve a container's bridge IP via `docker inspect`. Docker assigns the IP
+ * during container start, so the inspect call may briefly race the spawn —
+ * retry a few times before giving up. Returns null if the IP can't be found;
+ * callers should treat that as a soft failure (token usage will be recorded
+ * with agent=null until the container next spawns and re-registers).
+ */
+async function inspectContainerIp(
+  containerName: string,
+): Promise<string | null> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const ip = await new Promise<string>((resolve, reject) => {
+        exec(
+          // Default-bridge containers expose the IP under
+          // .NetworkSettings.Networks.bridge.IPAddress.
+          // The top-level .NetworkSettings.IPAddress is only populated
+          // for the legacy unnamed network and stays empty for these.
+          `docker inspect --format '{{.NetworkSettings.Networks.bridge.IPAddress}}' ${containerName}`,
+          { timeout: 5000 },
+          (err, stdout) => {
+            if (err) return reject(err);
+            resolve((stdout || '').trim());
+          },
+        );
+      });
+      if (ip.length > 0) return ip;
+    } catch {
+      // ignore; retry
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return null;
+}
 
 export interface ContainerInput {
   prompt: string;
@@ -122,6 +161,8 @@ function buildVolumeMounts(
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+  // World-writable so the container's node user can create subdirs (e.g. session-env)
+  fs.chmodSync(groupSessionsDir, 0o777);
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(
@@ -166,9 +207,12 @@ function buildVolumeMounts(
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  // Container runs as non-root (node user) — all IPC subdirs need to be world-writable
+  for (const subdir of ['messages', 'tasks', 'input']) {
+    const dir = path.join(groupIpcDir, subdir);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.chmodSync(dir, 0o777);
+  }
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -192,6 +236,10 @@ function buildVolumeMounts(
   );
   if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  }
+  if (fs.existsSync(groupAgentRunnerDir)) {
+    // World-writable so the container can recompile agent-runner on startup
+    fs.chmodSync(groupAgentRunnerDir, 0o777);
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -274,6 +322,9 @@ export async function runContainerAgent(
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+  // Container runs as node user (uid 1000); host may be root. Ensure the
+  // group workspace is world-writable so the container can write files.
+  fs.chmodSync(groupDir, 0o777);
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
@@ -312,6 +363,26 @@ export async function runContainerAgent(
     });
 
     onProcess(container, containerName);
+
+    // Register the container's bridge IP with the credential proxy so it can
+    // attribute Anthropic API calls to the right agent. The inspect runs
+    // async; until it completes the first call or two may post with
+    // agent=null. The VAN endpoint keeps those records intentionally.
+    let registeredIp: string | null = null;
+    const agentNameForProxy = input.assistantName || group.name;
+    inspectContainerIp(containerName)
+      .then((ip) => {
+        if (ip) {
+          registerContainer(ip, agentNameForProxy);
+          registeredIp = ip;
+        }
+      })
+      .catch((err) => {
+        logger.warn(
+          { err, containerName },
+          'Container IP inspect failed — token attribution will be null',
+        );
+      });
 
     let stdout = '';
     let stderr = '';
@@ -434,6 +505,10 @@ export async function runContainerAgent(
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      if (registeredIp) {
+        deregisterContainer(registeredIp);
+        registeredIp = null;
+      }
       const duration = Date.now() - startTime;
 
       if (timedOut) {
@@ -639,6 +714,10 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      if (registeredIp) {
+        deregisterContainer(registeredIp);
+        registeredIp = null;
+      }
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',
