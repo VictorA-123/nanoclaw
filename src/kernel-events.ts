@@ -17,10 +17,28 @@
  * later kernel change — either a completion endpoint (PATCH /runs/:id) or having
  * the kernel treat a `run_ended` event as closing the run. Not solved here.
  */
+import fs from 'fs';
+import path from 'path';
 import { logger } from './logger.js';
 
 const KERNEL_URL = process.env.KERNEL_URL || 'http://127.0.0.1:4100';
 const EVENT_EMIT_TIMEOUT_MS = 2500;
+
+// Pillar 2 step 2 — local queue + replay. When a POST /events fails, the event
+// is appended here (one JSON object per line) instead of being dropped, and is
+// re-sent (drained) on the next successful POST. Replays dedupe kernel-side via
+// idempotency_key, so re-sending an already-delivered event is a harmless 409.
+// Path is process.cwd()-relative — same convention as the Pillar 1 definition
+// cache (cache/definitions).
+const QUEUE = path.join(process.cwd(), 'cache', 'event-queue.jsonl');
+
+// Per-run monotonic counter → deterministic idempotency_key `${run_id}:${type}:${seq}`.
+// Uniqueness only has to hold within a run (kernel enforces UNIQUE(run_id,
+// idempotency_key)). Pruned on run_ended so the map can't grow unbounded.
+const runSeq = new Map<string, number>();
+
+// Re-entrancy guard: at most one drain runs at a time.
+let draining = false;
 
 // POST JSON to the kernel with a hard timeout. Returns the parsed body on 2xx,
 // or null on non-2xx. Throws only on network/timeout errors (callers catch).
@@ -85,17 +103,105 @@ export async function emitEvent(
   meta?: Record<string, unknown>,
 ): Promise<void> {
   if (!runId) return;
+  const run_id = runId;
+
+  // Deterministic, per-run idempotency key so a replay dedupes kernel-side.
+  const seq = (runSeq.get(run_id) ?? 0) + 1;
+  runSeq.set(run_id, seq);
+  const idempotency_key = `${run_id}:${type}:${seq}`;
+
+  const payload = {
+    run_id,
+    type,
+    content: content ?? undefined,
+    meta: meta ?? undefined,
+    idempotency_key,
+  };
+
   try {
-    await postKernel('/events', {
-      run_id: runId,
-      type,
-      content: content ?? undefined,
-      meta: meta ?? undefined,
-    });
+    await postKernel('/events', payload);
+    // Delivered — opportunistically flush anything queued during an outage.
+    void drainQueue();
   } catch (err) {
-    logger.warn(
-      { runId, type, err },
-      'event-emit: event POST failed — dropping',
-    );
+    // Kernel unreachable/timed out: persist instead of dropping (step 2).
+    // The whole persist path is itself guarded so emission never throws.
+    try {
+      fs.mkdirSync(path.dirname(QUEUE), { recursive: true });
+      fs.appendFileSync(QUEUE, JSON.stringify(payload) + '\n');
+    } catch (qerr) {
+      logger.warn(
+        { runId, type, err: qerr },
+        'event-emit: queue append failed — dropping',
+      );
+    }
+  } finally {
+    // Prune the counter once a run ends so runSeq can't grow unbounded.
+    if (type === 'run_ended') runSeq.delete(run_id);
+  }
+}
+
+/**
+ * Replay queued events (best-effort) once a successful POST proves the kernel is
+ * reachable again. Re-POSTs each queued line IN ORDER; a 2xx OR a 409
+ * (already-delivered, deduped by idempotency_key) counts as delivered. On the
+ * first hard failure it STOPS and preserves that line plus the remainder, so
+ * ordering is never broken. The queue is then rewritten crash-safely (temp file
+ * + atomic rename) or removed if fully drained — never truncated in place.
+ * Guarded by `draining`; never throws.
+ */
+async function drainQueue(): Promise<void> {
+  if (draining) return;
+  draining = true;
+  try {
+    if (!fs.existsSync(QUEUE)) return;
+    const lines = fs
+      .readFileSync(QUEUE, 'utf8')
+      .split('\n')
+      .filter((line) => line.length > 0);
+
+    let i = 0;
+    for (; i < lines.length; i++) {
+      let delivered = false;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), EVENT_EMIT_TIMEOUT_MS);
+      try {
+        const res = await fetch(`${KERNEL_URL}/events`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: lines[i],
+          signal: controller.signal,
+        });
+        // 409 = kernel already recorded it (idempotency_key dedup) → delivered.
+        delivered = res.ok || res.status === 409;
+      } catch {
+        delivered = false;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!delivered) break; // stop on first failure; keep this line + the rest
+    }
+
+    const remainder = lines.slice(i);
+    try {
+      if (remainder.length === 0) {
+        // Fully drained — remove the queue entirely.
+        fs.rmSync(QUEUE, { force: true });
+      } else {
+        // Crash-safe: write remainder to a temp file, then atomic-rename over
+        // QUEUE. Never an in-place truncate (a crash mid-write can't lose data).
+        const tmp = QUEUE + '.tmp';
+        fs.writeFileSync(tmp, remainder.join('\n') + '\n');
+        fs.renameSync(tmp, QUEUE);
+      }
+    } catch (err) {
+      logger.warn(
+        { err },
+        'event-emit: queue rewrite failed — will retry next drain',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'event-emit: drain failed');
+  } finally {
+    draining = false;
   }
 }
