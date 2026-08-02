@@ -397,7 +397,9 @@ async function startMessageLoop(): Promise<void> {
   }
   messageLoopRunning = true;
 
-  logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
+  logger.info(
+    `NanoClaw running (registered groups need no trigger; unregistered chats require @${ASSISTANT_NAME})`,
+  );
 
   while (true) {
     try {
