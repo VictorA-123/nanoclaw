@@ -616,7 +616,11 @@ export async function runContainerAgent(
           chatJid: input.chatJid,
           isMain: input.isMain,
         });
-        void emitEvent(runId, 'message_in', input.prompt);
+        // Kernel-mediated invocations already recorded message_in at invoke
+        // time (POST /agents/:id/invoke), so don't log a duplicate here.
+        if (!input.runId) {
+          void emitEvent(runId, 'message_in', input.prompt);
+        }
       })
       .catch(() => {});
   }

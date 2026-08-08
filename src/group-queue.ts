@@ -154,6 +154,15 @@ export class GroupQueue {
   }
 
   /**
+   * Read-only liveness check. Uses this.groups.get directly rather than
+   * getGroup() so probing an unseen JID does not create an empty state entry.
+   */
+  isActive(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    return state?.active === true;
+  }
+
+  /**
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
    */
