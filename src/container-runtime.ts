@@ -37,7 +37,8 @@ function detectProxyBindHost(): string {
     const ipv4 = docker0.find((a) => a.family === 'IPv4');
     if (ipv4) return ipv4.address;
   }
-  return '0.0.0.0';
+  logger.warn('docker0 interface not found at startup; credential proxy falling back to 127.0.0.1 (containers must reach it via host.docker.internal or PROXY_BIND_HOST env override)');
+  return '127.0.0.1';
 }
 
 /** CLI args needed for the container to resolve the host gateway. */
