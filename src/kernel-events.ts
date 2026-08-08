@@ -72,8 +72,14 @@ async function postKernel(pathname: string, body: unknown): Promise<any> {
  */
 export async function emitRunStarted(
   agentId: string,
-  opts: { channel?: string; invoked_by?: string } = {},
+  opts: { channel?: string; invoked_by?: string; run_id?: string } = {},
 ): Promise<string | null> {
+  if (opts.run_id) {
+    // Run already opened by the caller (e.g. kernel-mediated invocation via
+    // POST /agents/:id/invoke, which already ran cycle-detection + depth cap).
+    // Do not open a second run for the same invocation.
+    return opts.run_id;
+  }
   try {
     const run = await postKernel('/runs', {
       agent_id: agentId,
