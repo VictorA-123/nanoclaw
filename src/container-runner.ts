@@ -80,6 +80,23 @@ const AGENT_IDS: Record<string, string> = {
   whatsapp_main: 'agent:jammer',
   whatsapp_builder: 'agent:haddock',
 };
+
+const FOLDER_BY_AGENT_ID: Record<string, string> = Object.fromEntries(
+  Object.entries(AGENT_IDS).map(([folder, agentId]) => [agentId, folder]),
+);
+
+export function findGroupByAgentId(
+  agentId: string,
+  registeredGroups: Record<string, RegisteredGroup>,
+): { jid: string; group: RegisteredGroup } | null {
+  const folder = FOLDER_BY_AGENT_ID[agentId];
+  if (!folder) return null;
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.folder === folder) return { jid, group };
+  }
+  return null;
+}
+
 const KERNEL_URL = process.env.KERNEL_URL || 'http://127.0.0.1:4100';
 const DEFINITION_CACHE_DIR = path.join(process.cwd(), 'cache', 'definitions');
 const DEFINITION_FETCH_TIMEOUT_MS = 2500;
