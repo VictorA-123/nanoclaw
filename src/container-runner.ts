@@ -278,6 +278,7 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  runId?: string;
 }
 
 export interface ContainerOutput {
@@ -602,6 +603,7 @@ export async function runContainerAgent(
   const emitAgentId = AGENT_IDS[group.folder];
   const runIdPromise: Promise<string | null> = emitAgentId
     ? emitRunStarted(emitAgentId, {
+        run_id: input.runId,
         channel: 'whatsapp',
         invoked_by: input.chatJid,
       })
