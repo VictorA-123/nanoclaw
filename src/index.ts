@@ -45,6 +45,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import { startInvocationPoller } from './invocation-poller.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   restoreRemoteControl,
@@ -693,6 +694,24 @@ async function main(): Promise<void> {
         writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
       }
     },
+  });
+  startInvocationPoller({
+    registeredGroups: () => registeredGroups,
+    sendMessage: async (jid, text) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) {
+        logger.warn(
+          { jid },
+          'No channel owns JID, cannot send invocation reply',
+        );
+        return;
+      }
+      const formatted = formatOutbound(text);
+      if (formatted) await channel.sendMessage(jid, formatted);
+    },
+    onProcess: (chatJid, proc, containerName, groupFolder) =>
+      queue.registerProcess(chatJid, proc, containerName, groupFolder),
+    isGroupActive: (chatJid) => queue.isActive(chatJid),
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
