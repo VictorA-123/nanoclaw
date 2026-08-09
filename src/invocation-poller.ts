@@ -118,6 +118,12 @@ export function startInvocationPoller(deps: InvocationPollerDeps): void {
             (proc, containerName) =>
               deps.onProcess(chatJid, proc, containerName, group.folder),
             async (output: ContainerOutput) => {
+              // For internal agents (e.g. agent:sketch), chatJid is a synthetic key
+              // like 'internal:sketch' that owns no real channel. sendMessage's
+              // findChannel() lookup returns nothing for it and no-ops with a warning
+              // log — this is intentional, not a bug: internal agents' output goes to
+              // the kernel as events only, never to any external channel. Do not "fix"
+              // that warning.
               if (output.result) {
                 await deps.sendMessage(chatJid, output.result);
               }

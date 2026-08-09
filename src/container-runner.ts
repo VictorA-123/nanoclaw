@@ -79,6 +79,7 @@ async function inspectContainerIp(
 const AGENT_IDS: Record<string, string> = {
   whatsapp_main: 'agent:jammer',
   whatsapp_builder: 'agent:haddock',
+  sketch: 'agent:sketch',
 };
 
 const FOLDER_BY_AGENT_ID: Record<string, string> = Object.fromEntries(
@@ -91,6 +92,18 @@ export function findGroupByAgentId(
 ): { jid: string; group: RegisteredGroup } | null {
   const folder = FOLDER_BY_AGENT_ID[agentId];
   if (!folder) return null;
+  if (agentId === 'agent:sketch') {
+    return {
+      jid: 'internal:sketch',
+      group: {
+        name: 'Sketch',
+        folder: 'sketch',
+        trigger: '',
+        added_at: new Date(0).toISOString(),
+        isMain: false,
+      },
+    };
+  }
   for (const [jid, group] of Object.entries(registeredGroups)) {
     if (group.folder === folder) return { jid, group };
   }
