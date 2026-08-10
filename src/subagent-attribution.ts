@@ -127,8 +127,10 @@ interface ParsedConsultation {
   prompt: string;
   response: string;
   model: string;
-  tokensIn: number;
-  tokensOut: number;
+  inputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+  outputTokens: number;
 }
 
 function parseConsultation(
@@ -181,11 +183,10 @@ function parseConsultation(
   const response = extractText(lastEntry?.message?.content);
   const model = lastEntry?.message?.model ?? 'unknown';
   const usage = lastEntry?.message?.usage ?? {};
-  const tokensIn =
-    (usage.input_tokens ?? 0) +
-    (usage.cache_creation_input_tokens ?? 0) +
-    (usage.cache_read_input_tokens ?? 0);
-  const tokensOut = usage.output_tokens ?? 0;
+  const inputTokens = usage.input_tokens ?? 0;
+  const cacheCreationInputTokens = usage.cache_creation_input_tokens ?? 0;
+  const cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
+  const outputTokens = usage.output_tokens ?? 0;
 
   if (!prompt || !response) return null;
 
@@ -196,8 +197,10 @@ function parseConsultation(
     prompt,
     response,
     model,
-    tokensIn,
-    tokensOut,
+    inputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
+    outputTokens,
   };
 }
 
@@ -313,8 +316,10 @@ async function reportConsultation(c: ParsedConsultation): Promise<boolean> {
       agent_id: c.mappedAgentId,
       run_id: childRunId,
       model: c.model,
-      tokens_in: c.tokensIn,
-      tokens_out: c.tokensOut,
+      input_tokens: c.inputTokens,
+      cache_creation_input_tokens: c.cacheCreationInputTokens,
+      cache_read_input_tokens: c.cacheReadInputTokens,
+      output_tokens: c.outputTokens,
     },
   });
   if (!usagePosted?.ok) {
