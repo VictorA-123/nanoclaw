@@ -46,6 +46,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { startInvocationPoller } from './invocation-poller.js';
+import { startSubagentAttributionPoller } from './subagent-attribution.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   restoreRemoteControl,
@@ -713,6 +714,7 @@ async function main(): Promise<void> {
       queue.registerProcess(chatJid, proc, containerName, groupFolder),
     isGroupActive: (chatJid) => queue.isActive(chatJid),
   });
+  startSubagentAttributionPoller();
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
   startMessageLoop().catch((err) => {
