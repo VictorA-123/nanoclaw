@@ -74,7 +74,10 @@ function saveProcessed(processed: Set<string>): void {
     fs.writeFileSync(tmp, JSON.stringify([...processed], null, 2) + '\n');
     fs.renameSync(tmp, PROCESSED_FILE);
   } catch (err) {
-    logger.warn({ err }, 'subagent-attribution: failed to persist processed set');
+    logger.warn(
+      { err },
+      'subagent-attribution: failed to persist processed set',
+    );
   }
 }
 
@@ -239,7 +242,11 @@ async function reportConsultation(c: ParsedConsultation): Promise<boolean> {
   const openRuns = await kernelFetch(
     `/runs?agent_id=${encodeURIComponent(c.watcherAgentId)}&status=started`,
   );
-  if (!openRuns?.ok || !Array.isArray(openRuns.json) || openRuns.json.length === 0) {
+  if (
+    !openRuns?.ok ||
+    !Array.isArray(openRuns.json) ||
+    openRuns.json.length === 0
+  ) {
     logger.warn(
       { watcherAgentId: c.watcherAgentId },
       'subagent-attribution: no open run found for watcher, will retry next tick',
