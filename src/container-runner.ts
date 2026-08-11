@@ -122,6 +122,9 @@ interface ResolvedDefinition {
   groupFolderPath: string;
   // Kernel/cache-recorded context path, for the registry-vs-reality log (null for legacy).
   contextPath: string | null;
+  // Kernel/cache-recorded model pin, threaded to the container. Undefined when
+  // the definition names no model, or on legacy-local (no definition at all).
+  model?: string;
 }
 
 // Extract the nanoclaw_group runtime's absolute group_folder from a definition.
@@ -145,6 +148,29 @@ function extractGroupFolder(definition: any): string | null {
     }
   }
   return null;
+}
+
+// Extract the nanoclaw_group runtime's model pin from a definition.
+// Sibling of extractGroupFolder(): same runtime_type filter, different key.
+// Returns undefined if there is no matching runtime, no model key, or the
+// config is malformed (bad JSON is swallowed) — never throws, so the container
+// simply falls back to its own isMain default.
+function extractModel(definition: any): string | undefined {
+  const runtimes = Array.isArray(definition?.runtimes)
+    ? definition.runtimes
+    : [];
+  for (const rt of runtimes) {
+    if (rt?.runtime_type !== 'nanoclaw_group') continue;
+    try {
+      const cfg = JSON.parse(rt?.config ?? '{}');
+      if (typeof cfg?.model === 'string' && cfg.model.length > 0) {
+        return cfg.model;
+      }
+    } catch {
+      // malformed runtime config — treat as no model
+    }
+  }
+  return undefined;
 }
 
 function extractContextPath(definition: any): string | null {
@@ -187,6 +213,7 @@ async function resolveSpawnDefinition(
       source: 'legacy-local',
       groupFolderPath: legacyFolder,
       contextPath: null,
+      model: undefined,
     };
   }
 
@@ -240,6 +267,7 @@ async function resolveSpawnDefinition(
         source: 'kernel',
         groupFolderPath: folder,
         contextPath: extractContextPath(kernelDef),
+        model: extractModel(kernelDef),
       };
     }
     logger.warn(
@@ -262,6 +290,7 @@ async function resolveSpawnDefinition(
         source: 'cache-fallback',
         groupFolderPath: folder,
         contextPath: extractContextPath(cached),
+        model: extractModel(cached),
       };
     }
     logger.warn(
@@ -280,6 +309,7 @@ async function resolveSpawnDefinition(
     source: 'legacy-local',
     groupFolderPath: legacyFolder,
     contextPath: null,
+    model: undefined,
   };
 }
 
@@ -292,6 +322,8 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   runId?: string;
+  // Kernel-resolved model pin. Absent => the container keeps its isMain default.
+  model?: string;
 }
 
 export interface ContainerOutput {
@@ -553,6 +585,12 @@ export async function runContainerAgent(
       contextPath: null,
     };
   }
+
+  // Phase 6: ride the resolved model pin along on the container input (it is
+  // serialized to the container's stdin below). Undefined on legacy-local and
+  // on definitions that name no model — the container then keeps its own
+  // isMain default, so behavior is unchanged from today.
+  input.model = resolved.model;
 
   const groupDir = resolved.groupFolderPath;
   fs.mkdirSync(groupDir, { recursive: true });

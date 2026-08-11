@@ -27,6 +27,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  model?: string;
 }
 
 interface ContainerOutput {
@@ -396,7 +397,11 @@ async function runQuery(
       // fast, token-light personal chat; Haddock (builder) runs Opus 4.8 for
       // agentic coding/research. Pro-subscription auth, so this trades against
       // usage limits, not per-token billing.
-      model: containerInput.isMain ? 'claude-sonnet-4-6' : 'claude-opus-4-8',
+      // Kernel-supplied pin wins when present and non-empty; otherwise fall
+      // back to exactly the previous per-agent default.
+      model: containerInput.model && containerInput.model.length > 0
+        ? containerInput.model
+        : containerInput.isMain ? 'claude-sonnet-4-6' : 'claude-opus-4-8',
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
