@@ -26,6 +26,7 @@ import {
   ensureContainerRuntimeRunning,
   PROXY_BIND_HOST,
 } from './container-runtime.js';
+import { reconcileOrphanedRuns } from './startup-reconcile.js';
 import {
   deleteSession,
   getAllChats,
@@ -520,6 +521,7 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+  void reconcileOrphanedRuns();
   initDatabase();
   logger.info('Database initialized');
   loadState();

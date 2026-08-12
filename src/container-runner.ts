@@ -76,7 +76,7 @@ async function inspectContainerIp(
 // --- Phase 3 pillar 1: definition-fetch — REAL (kernel-primary, cache fallback) ---
 // Explicit group.folder -> kernel agent-id map. Only mapped groups are driven by
 // the kernel definition; unmapped groups always use the legacy-local path.
-const AGENT_IDS: Record<string, string> = {
+export const AGENT_IDS: Record<string, string> = {
   whatsapp_main: 'agent:jammer',
   whatsapp_builder: 'agent:haddock',
   sketch: 'agent:sketch',
