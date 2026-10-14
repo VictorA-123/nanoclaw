@@ -92,15 +92,36 @@ function sha256(data: Buffer | string): string {
 }
 
 /**
+ * A target must resolve INSIDE the NanoClaw project root. The registry is
+ * Victor-only, so this is not a trust boundary against an attacker — it is a
+ * blast-radius limit on a typo or a stale row: without it, a `context_targets`
+ * entry of `.env` or `/etc/shadow` would push that file's bytes into kernel.db
+ * as durable, backed-up history. Same `path.relative` shape as
+ * group-folder.ts's ensureWithinBase.
+ */
+function isWithinProjectRoot(abs: string, projectRoot: string): boolean {
+  const rel = path.relative(path.resolve(projectRoot), abs);
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+/**
  * Read one target's real bytes. Targets are recorded relative to the NanoClaw
  * project root (e.g. `groups/sketch/dashboard-context.md`); an absolute path is
- * used as-is. Returns null on any problem — missing file, directory, oversize.
+ * accepted only if it also lands inside the project root. Returns null on any
+ * problem — outside the root, missing, a directory, oversize.
  */
 function readTarget(
   target: string,
   projectRoot: string,
 ): { abs: string; bytes: Buffer } | null {
   const abs = path.resolve(projectRoot, target);
+  if (!isWithinProjectRoot(abs, projectRoot)) {
+    logger.warn(
+      { target: abs, projectRoot },
+      'context-ingest: target resolves outside the project root — refusing to read',
+    );
+    return null;
+  }
   try {
     const st = fs.statSync(abs);
     if (!st.isFile()) return null;

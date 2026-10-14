@@ -175,6 +175,54 @@ describe('ingestContextVersion', () => {
     ).toHaveLength(0);
   });
 
+  it('refuses a target that escapes the project root', async () => {
+    const outside = path.join(
+      os.tmpdir(),
+      `nanoclaw-outside-${process.pid}.md`,
+    );
+    fs.writeFileSync(outside, 'SECRET');
+    const nested = path.join(root, 'project');
+    fs.mkdirSync(nested);
+
+    const out = await ingestContextVersion('agent:x', {
+      targets: [path.relative(nested, outside)], // ../../something.md
+      latestContent: null,
+      projectRoot: nested,
+    });
+
+    expect(out).toBe('unreadable');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(logger.warn)
+        .mock.calls.some((c) =>
+          String(c[1]).includes('outside the project root'),
+        ),
+    ).toBe(true);
+    fs.rmSync(outside, { force: true });
+  });
+
+  it('refuses an absolute target outside the project root', async () => {
+    const out = await ingestContextVersion('agent:x', {
+      targets: ['/etc/hostname'],
+      latestContent: null,
+      projectRoot: root,
+    });
+    expect(out).toBe('unreadable');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('accepts an absolute target that is inside the project root', async () => {
+    const abs = path.join(root, 'ctx.md');
+    fs.writeFileSync(abs, 'inside');
+    const out = await ingestContextVersion('agent:x', {
+      targets: [abs],
+      latestContent: null,
+      projectRoot: root,
+    });
+    expect(out).toBe('posted');
+  });
+
   it('skips cleanly when the primary target is missing', async () => {
     const out = await ingestContextVersion('agent:x', {
       targets: ['nope.md'],
