@@ -1,0 +1,72 @@
+# PROPOSED nanoclaw.service — NOT INSTALLED.
+#
+# Phase 6 close-out, Part C. This file is a reference copy for review only.
+# Nothing in the repo reads it and `npm run setup` does not install it; the
+# generator in setup/service.ts writes the unit, and the live unit is at
+# /etc/systemd/system/nanoclaw.service.
+#
+# Installing it is a deliberate, warned step (it needs a nanoclaw restart):
+#   cp deploy/nanoclaw.service.proposed /etc/systemd/system/nanoclaw.service
+#   # strip these comment lines first if you want the live file to stay terse
+#   systemctl daemon-reload
+#   systemctl restart nanoclaw        # WARNING: live WhatsApp. Tell Victor first.
+#
+# Three changes vs. the live unit (see nanoclaw.service.patch):
+#
+# 1. After=docker.service — follow-up (d). Today the unit only orders itself
+#    After=network.target, so on boot NanoClaw can start before dockerd. That
+#    is the ordering nondeterminism behind the credential-proxy incident
+#    (docker0 absent at start -> bridge detection failed). The code now fails
+#    closed to 127.0.0.1 and CREDENTIAL_PROXY_HOST is pinned by an override, so
+#    there is no live exposure — this closes the ordering gap itself.
+#
+# 2. Wants=docker.service — a weak dependency on purpose, not Requires=. With
+#    Requires=, a docker.service failure would stop NanoClaw outright, taking
+#    WhatsApp down with it; with Wants=, docker is pulled in and ordered first,
+#    but NanoClaw still starts and its own ensureContainerRuntimeRunning() can
+#    recover the runtime. Note this does NOT make a docker restart safe: ruling
+#    2-1 still excludes docker.service from needrestart's automatic restarts.
+#
+# 3. TimeoutStopSec=330 — the drain bound (NANOCLAW_DRAIN_TIMEOUT_MS, default
+#    300s) plus 30s of headroom, so systemd never SIGKILLs the process in the
+#    middle of its own drain. KEEP THESE TWO IN SYNC: if the drain bound is
+#    changed, this value must change with it. Drain itself is Part D and is
+#    NOT implemented yet — until it is, this unit only means "wait up to 330s
+#    for shutdown", which is harmless because today's shutdown returns in
+#    well under a second.
+#
+# KillMode=process is deliberately unchanged: it keeps systemd from killing the
+# `docker run` children out from under the drain.
+#
+# DRIFT WARNING, left for the reviewer to rule on. The unit generator lives in
+# setup/service.ts (an inline template string), and setup/service.test.ts holds
+# a SECOND, hand-copied duplicate of that template. `npm run setup` rewrites
+# /etc/systemd/system/nanoclaw.service from the generator, so re-running setup
+# after installing this would silently drop all three lines below. Making the
+# change stick means editing the generator too — deliberately NOT done here,
+# because it also affects user-level systemd installs (where `docker.service`
+# is not a user unit) and fresh non-Linux installs. Options:
+#   (a) leave as is and treat `npm run setup` as a known re-break;
+#   (b) add the three lines to the generator behind the existing isSystem flag,
+#       and de-duplicate the template the test copies.
+
+[Unit]
+Description=NanoClaw Personal Assistant
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /root/nanoclaw/dist/index.js
+WorkingDirectory=/root/nanoclaw
+Restart=always
+RestartSec=5
+KillMode=process
+TimeoutStopSec=330
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/root/.local/bin
+StandardOutput=append:/root/nanoclaw/logs/nanoclaw.log
+StandardError=append:/root/nanoclaw/logs/nanoclaw.error.log
+
+[Install]
+WantedBy=multi-user.target
