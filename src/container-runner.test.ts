@@ -42,6 +42,9 @@ vi.mock('fs', async () => {
       readdirSync: vi.fn(() => []),
       statSync: vi.fn(() => ({ isDirectory: () => false })),
       copyFileSync: vi.fn(),
+      // mkdirSync is mocked away, so the group dir never actually exists and
+      // the real chmodSync threw ENOENT, failing all three timeout tests.
+      chmodSync: vi.fn(),
     },
   };
 });

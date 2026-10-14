@@ -3,6 +3,7 @@
  * Spawns agent execution in containers and handles IPC
  */
 import { ChildProcess, exec, spawn } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -32,6 +33,11 @@ import {
 } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { emitRunStarted, emitEvent } from './kernel-events.js';
+import {
+  extractContextTargets,
+  extractLatestContextContent,
+  ingestContextVersion,
+} from './context-ingest.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -125,6 +131,14 @@ interface ResolvedDefinition {
   // Kernel/cache-recorded model pin, threaded to the container. Undefined when
   // the definition names no model, or on legacy-local (no definition at all).
   model?: string;
+  // P1-4: the agent's ordered `context_targets` from the nanoclaw_group runtime
+  // config. Empty when the agent has none configured, which means "ingest does
+  // not apply here — behave exactly as before".
+  contextTargets: string[];
+  // Content of the kernel's latest context version, as the definition reported
+  // it. Only meaningful when source === 'kernel'; a cached definition's copy may
+  // be stale, and ingesting against stale state would post a redundant version.
+  latestContextContent: string | null;
 }
 
 // Extract the nanoclaw_group runtime's absolute group_folder from a definition.
@@ -214,6 +228,8 @@ async function resolveSpawnDefinition(
       groupFolderPath: legacyFolder,
       contextPath: null,
       model: undefined,
+      contextTargets: [],
+      latestContextContent: null,
     };
   }
 
@@ -268,6 +284,8 @@ async function resolveSpawnDefinition(
         groupFolderPath: folder,
         contextPath: extractContextPath(kernelDef),
         model: extractModel(kernelDef),
+        contextTargets: extractContextTargets(kernelDef),
+        latestContextContent: extractLatestContextContent(kernelDef),
       };
     }
     logger.warn(
@@ -291,6 +309,10 @@ async function resolveSpawnDefinition(
         groupFolderPath: folder,
         contextPath: extractContextPath(cached),
         model: extractModel(cached),
+        // Targets are carried so the spawn log stays accurate, but ingest is
+        // skipped on this tier — see latestContextContent above.
+        contextTargets: extractContextTargets(cached),
+        latestContextContent: null,
       };
     }
     logger.warn(
@@ -310,7 +332,72 @@ async function resolveSpawnDefinition(
     groupFolderPath: legacyFolder,
     contextPath: null,
     model: undefined,
+    contextTargets: [],
+    latestContextContent: null,
   };
+}
+
+/** Every regular file under `root`, as paths relative to `root`. */
+function listFilesRecursive(root: string): string[] {
+  const out: string[] = [];
+  const walk = (dir: string, rel: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const relPath = rel ? path.join(rel, entry.name) : entry.name;
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(abs, relPath);
+      else if (entry.isFile()) out.push(relPath);
+    }
+  };
+  walk(root, '');
+  return out;
+}
+
+function sha256File(file: string): string | null {
+  try {
+    return crypto
+      .createHash('sha256')
+      .update(fs.readFileSync(file))
+      .digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Phase 6 close-out (FABLE ruling P1-6): refresh a group's agent-runner staging
+ * copy when it has gone stale.
+ *
+ * The staging dir used to be populated ONCE (`if (!fs.existsSync(dst))`), so a
+ * group registered before an agent-runner change kept running the old code
+ * forever — the same species of silent drift as the context files, but for code.
+ *
+ * Staleness is decided by CONTENT HASH, never mtime: `npm install`, a git
+ * checkout or a file copy all rewrite mtimes without changing bytes, and we do
+ * not want to churn (or log) on those.
+ *
+ * It NEVER deletes. Files that exist only in the group's staging dir are the
+ * group's own data — agent customizations, build output from entrypoint.sh —
+ * and are left exactly as they are. Only files that ship in the source tree are
+ * written, and only when their bytes differ.
+ *
+ * Returns the relative paths that were (re)written, so the caller can log them.
+ */
+export function syncStagedAgentRunner(
+  srcDir: string,
+  dstDir: string,
+): string[] {
+  const synced: string[] = [];
+  for (const rel of listFilesRecursive(srcDir)) {
+    const srcFile = path.join(srcDir, rel);
+    const dstFile = path.join(dstDir, rel);
+    const srcHash = sha256File(srcFile);
+    if (srcHash === null) continue; // unreadable source file — leave staging alone
+    if (srcHash === sha256File(dstFile)) continue; // identical bytes — nothing to do
+    fs.mkdirSync(path.dirname(dstFile), { recursive: true });
+    fs.copyFileSync(srcFile, dstFile);
+    synced.push(rel);
+  }
+  return synced;
 }
 
 export interface ContainerInput {
@@ -481,8 +568,31 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  // P1-6: sync-if-stale by content hash (was: copy-once, so the staged copy
+  // never saw a single agent-runner change after the group's first spawn).
+  if (fs.existsSync(agentRunnerSrc)) {
+    try {
+      fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
+      const synced = syncStagedAgentRunner(agentRunnerSrc, groupAgentRunnerDir);
+      if (synced.length > 0) {
+        logger.info(
+          {
+            group: group.folder,
+            src: agentRunnerSrc,
+            dst: groupAgentRunnerDir,
+            files: synced,
+          },
+          `agent-runner staging synced (${synced.length} stale file${synced.length === 1 ? '' : 's'}): ${synced.join(', ')}`,
+        );
+      }
+    } catch (err) {
+      // Staging is best-effort: a failed sync leaves whatever is already
+      // staged in place, which is exactly today's behavior.
+      logger.warn(
+        { group: group.folder, err },
+        'agent-runner staging sync failed — keeping the existing staged copy',
+      );
+    }
   }
   if (fs.existsSync(groupAgentRunnerDir)) {
     // World-writable so the container can recompile agent-runner on startup
@@ -583,6 +693,8 @@ export async function runContainerAgent(
       source: 'legacy-local',
       groupFolderPath: resolveGroupFolderPath(group.folder),
       contextPath: null,
+      contextTargets: [],
+      latestContextContent: null,
     };
   }
 
@@ -598,20 +710,56 @@ export async function runContainerAgent(
   // group workspace is world-writable so the container can write files.
   fs.chmodSync(groupDir, 0o777);
 
-  // Log which tier drove this spawn, plus the registry-vs-reality comparison
-  // (kernel-recorded context path vs. the dashboard-context.md we mount).
+  // Log which tier drove this spawn.
+  //
+  // Two shapes, because the meaning of context_version.content differs by era:
+  //  - no context_targets (pre-ingest / unmapped): content is still the backfilled
+  //    FILE PATH, so the original registry-vs-reality path comparison holds.
+  //  - context_targets configured (ingest era): content is the file's real BODY.
+  //    Comparing it to a path would always say "no match" and would dump the whole
+  //    context file into the log, so the targets are logged instead.
+  const spawnAgentId = AGENT_IDS[group.folder] ?? null;
   const localContext = path.join(groupDir, 'dashboard-context.md');
-  logger.info(
-    {
-      group: group.name,
-      agentId: AGENT_IDS[group.folder] ?? null,
-      spawnSource: resolved.source,
-      kernel: resolved.contextPath,
-      local: localContext,
-      match: resolved.contextPath === localContext,
-    },
-    `Definition-driven spawn — source: ${resolved.source} / kernel: ${resolved.contextPath} / local: ${localContext} / match: ${resolved.contextPath === localContext}`,
-  );
+  if (resolved.contextTargets.length > 0) {
+    logger.info(
+      {
+        group: group.name,
+        agentId: spawnAgentId,
+        spawnSource: resolved.source,
+        contextTargets: resolved.contextTargets,
+      },
+      `Definition-driven spawn — source: ${resolved.source} / context targets: ${resolved.contextTargets.join(', ')}`,
+    );
+  } else {
+    logger.info(
+      {
+        group: group.name,
+        agentId: spawnAgentId,
+        spawnSource: resolved.source,
+        kernel: resolved.contextPath,
+        local: localContext,
+        match: resolved.contextPath === localContext,
+      },
+      `Definition-driven spawn — source: ${resolved.source} / kernel: ${resolved.contextPath} / local: ${localContext} / match: ${resolved.contextPath === localContext}`,
+    );
+  }
+
+  // Phase 6 close-out (P1-3/P1-4): mirror the real context file into the kernel
+  // if it has changed. Fire-and-forget by design — rule 6: a kernel outage must
+  // never block a spawn. The trigger is a hash mismatch, which survives a failed
+  // attempt, so a dropped ingest simply happens at the next spawn.
+  // Only the kernel tier ingests: a cache-fallback definition's context version
+  // may be stale, and comparing against stale state would post a duplicate.
+  if (
+    spawnAgentId &&
+    resolved.source === 'kernel' &&
+    resolved.contextTargets.length > 0
+  ) {
+    void ingestContextVersion(spawnAgentId, {
+      targets: resolved.contextTargets,
+      latestContent: resolved.latestContextContent,
+    });
+  }
 
   const mounts = buildVolumeMounts(group, input.isMain, groupDir);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
