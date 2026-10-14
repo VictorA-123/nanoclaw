@@ -32,7 +32,12 @@ TimeoutStartSec=180
 # Read-only everywhere except its own state file. The probe never opens
 # kernel.db — it writes through the kernel API, preserving the sole-writer rule.
 ProtectSystem=strict
-ProtectHome=true
+# read-only, NOT true: ProtectHome=true makes /root an empty tmpfs, and
+# ExecStart lives at /root/nanoclaw/scripts/. The probe only ever reads from
+# there, so read-only is both sufficient and the strongest setting that works.
+# `systemd-analyze verify` does not catch this — it checks unit syntax, not
+# whether the sandbox hides the binary.
+ProtectHome=read-only
 PrivateTmp=true
 # Creates and grants write access to /var/lib/nanoclaw, which is the probe's
 # default state path (RESTART_DEBT_STATE). No other writable path is needed.
