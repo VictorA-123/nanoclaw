@@ -168,16 +168,42 @@ describe('GroupQueue', () => {
 
   // --- Shutdown prevents new enqueues ---
 
-  it('prevents new enqueues after shutdown', async () => {
+  it('prevents new enqueues after beginDrain', async () => {
     const processMessages = vi.fn(async () => true);
     queue.setProcessMessagesFn(processMessages);
 
-    await queue.shutdown(1000);
+    queue.beginDrain();
 
     queue.enqueueMessageCheck('group1@g.us');
+    queue.enqueueTask('group1@g.us', 'task1', async () => {});
     await vi.advanceTimersByTimeAsync(100);
 
     expect(processMessages).not.toHaveBeenCalled();
+    expect(queue.isShuttingDown()).toBe(true);
+  });
+
+  // Drain, follow-up (g): piping a newly arrived message into a container we
+  // are about to stop would advance lastAgentTimestamp for a message that never
+  // gets answered. The caller must see `false` and leave it unconsumed.
+  it('refuses to pipe messages into an active container while draining', async () => {
+    const processMessages = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 100_000));
+      return true;
+    });
+    queue.setProcessMessagesFn(processMessages);
+
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+    queue.registerProcess(
+      'group1@g.us',
+      { killed: false } as never,
+      'nanoclaw-group1-1',
+      'group1',
+    );
+    expect(queue.isActive('group1@g.us')).toBe(true);
+
+    queue.beginDrain();
+    expect(queue.sendMessage('group1@g.us', 'hello')).toBe(false);
   });
 
   // --- Max retries exceeded ---

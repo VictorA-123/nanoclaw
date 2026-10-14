@@ -1,7 +1,13 @@
-# Drain on shutdown — PLAN (follow-up (g)), not implemented
+# Drain on shutdown (follow-up (g))
 
-Status: **plan only**. No drain code is in this branch. Step 2 happens after the
-reviewer approves this page.
+Status: **IMPLEMENTED** on branch `phase6/closeout-1`, step 2, after the
+reviewer approved this plan. Not deployed. Code: `src/drain.ts`, the shutdown
+handler in `src/index.ts`, `GroupQueue.beginDrain()`, the active-run registry in
+`src/container-runner.ts`. Tests: `src/drain.test.ts` plus the
+`active-run registry` block in `src/container-runner.test.ts`.
+
+The plan below is unchanged apart from this header and §8, which now records
+the decisions instead of asking the questions.
 
 Ruling (FABLE 2026-10-06, follow-up (g)): on SIGTERM, **refuse new work, wait a
 bounded time for active runs to finish, then stop.** "Spare detached containers"
@@ -181,17 +187,36 @@ backstop for the cases a drain cannot cover — crash, SIGKILL, power loss,
 
 ---
 
-## 8. Open questions for the reviewer
+## 8. Decisions (were open questions)
 
-1. **Scheduled tasks mid-drain.** A task container that is stopped at the bound
-   is recorded as run, not retried — unlike messages, tasks are not re-derived
-   from SQLite. Should a drain-killed task be rescheduled (next_run reset), or
-   is "it ran, it was cut short" acceptable? Not assumed either way here.
-2. **300s against real agent runs.** `CONTAINER_TIMEOUT` is 3600000 (1h) and
-   `IDLE_TIMEOUT` is 1800000 (30m). A Haddock coding run can legitimately exceed
-   300s, so a mid-work restart will still cut it off — just observably now, with
-   `drain-timeout` instead of silence. Is 300s the number you want, or should the
-   default sit higher with `TimeoutStopSec` following it?
-3. **Is a drain-timeout kill worth an outbound WhatsApp line** ("I was restarted
-   mid-task, re-send that")? It would make the loss visible to Victor rather than
-   only in the event log, but it writes to a live channel during shutdown.
+1. **Scheduled tasks mid-drain: NOT rescheduled.** A task stopped at the bound
+   takes the normal error path, so `updateTaskAfterRun()` advances it to its
+   next scheduled slot — the missed occurrence is skipped, not retried. It must
+   not vanish silently though, so the drain writes
+   `cache/drain-interrupted.json` and `reportInterruptedRuns()` logs each
+   cut-off task by id at the next startup, before recovery runs. Caveat worth
+   knowing: that bookkeeping runs inside the settle window (§5.6). If the window
+   expires first, `next_run` stays in the past and the scheduler picks the task
+   up again after the restart — the startup log names it either way.
+2. **The bound stays 300s**, tunable with `NANOCLAW_DRAIN_TIMEOUT_MS`.
+   `TimeoutStopSec` is generated from the same default (`setup/service.ts`), so
+   a fresh install stays consistent; an already-installed unit does not follow
+   and must be edited by hand.
+3. **Yes, one short outbound line on drain-timeout.** `drainNotice()`: a message
+   run gets "I was restarted mid-task… please re-send your last message"; a
+   scheduled task gets wording about its next scheduled time, because "re-send"
+   is not the user action for a task nobody sent. Each send is bounded at 5s and
+   its failure is swallowed; internal agents (synthetic `internal:` JIDs) own no
+   channel and are skipped.
+
+## 9. Post-bound time budget
+
+`TimeoutStopSec` only grants 30s over the bound, so everything after step 4 is
+parallel and bounded:
+
+| phase | bound |
+|---|---|
+| per-run: resolve runId (1s) → `run_ended` emit (2.5s) → `docker stop -t 1` | all runs in parallel, ≈5s |
+| notify (5s each) and settle (10s), concurrent | ≤10s |
+
+≈15s of the 30s headroom, with the rest absorbing slow `docker stop` calls.

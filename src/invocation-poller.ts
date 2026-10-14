@@ -24,6 +24,14 @@ export interface InvocationPollerDeps {
     groupFolder: string,
   ) => void;
   isGroupActive: (chatJid: string) => boolean;
+  /**
+   * Drain guard (follow-up (g)). This poller calls runContainerAgent() directly
+   * and never touches GroupQueue, so GroupQueue.beginDrain() does not stop it —
+   * without this it would happily start a brand-new kernel-invoked container in
+   * the middle of a shutdown. The run stays status:'started' at the kernel and
+   * is picked up again after the restart, exactly as when a group is busy.
+   */
+  isShuttingDown: () => boolean;
 }
 
 interface KernelRun {
@@ -52,6 +60,10 @@ export function startInvocationPoller(deps: InvocationPollerDeps): void {
   pollerRunning = true;
 
   const poll = async () => {
+    if (deps.isShuttingDown()) {
+      logger.debug('invocation-poller: draining — not picking up new runs');
+      return; // no re-arm: the process is on its way out
+    }
     let runs: KernelRun[];
     try {
       const res = await fetch(
@@ -72,6 +84,9 @@ export function startInvocationPoller(deps: InvocationPollerDeps): void {
 
     for (const run of runs) {
       if (inProgress.has(run.id)) continue;
+      // Re-checked per run: the drain can start mid-tick, between the fetch
+      // above and this spawn.
+      if (deps.isShuttingDown()) break;
 
       const resolved = findGroupByAgentId(run.agent_id, registeredGroups);
       if (!resolved) {

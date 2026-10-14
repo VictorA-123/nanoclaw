@@ -9,6 +9,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { DEFAULT_DRAIN_TIMEOUT_MS } from '../src/config.js';
 import { logger } from '../src/logger.js';
 import {
   getPlatform,
@@ -201,6 +202,56 @@ function checkDockerGroupStale(): boolean {
   }
 }
 
+/**
+ * The systemd unit text. Exported so setup/service.test.ts asserts against THIS
+ * template instead of a hand-copied duplicate — the duplicate had already
+ * drifted out of anyone's attention, and Phase 6 close-out Part C is exactly the
+ * kind of change that would have been silently reverted by the next
+ * `npm run setup`.
+ *
+ * Phase 6 close-out, Part C (FABLE follow-up (d)) — system-level installs only:
+ *  - After=docker.service / Wants=docker.service close the boot ordering gap
+ *    behind the credential-proxy incident. Wants, not Requires: a docker
+ *    failure must not stop NanoClaw and take WhatsApp down with it.
+ *  - TimeoutStopSec is the drain bound (NANOCLAW_DRAIN_TIMEOUT_MS, default
+ *    300s) plus 30s of headroom, so systemd cannot SIGKILL the process in the
+ *    middle of its own drain. KEEP THE TWO IN SYNC.
+ *
+ * None of it applies to a user-level unit: `docker.service` is not a user unit,
+ * so ordering against it there would be meaningless.
+ */
+export function generateSystemdUnit(
+  nodePath: string,
+  projectRoot: string,
+  homeDir: string,
+  isSystem: boolean,
+  drainTimeoutMs: number = DEFAULT_DRAIN_TIMEOUT_MS,
+): string {
+  const stopSec = Math.ceil(drainTimeoutMs / 1000) + 30;
+  const dockerOrdering = isSystem ? ' docker.service' : '';
+  const wants = isSystem ? '\nWants=docker.service' : '';
+  const timeoutStop = isSystem ? `\nTimeoutStopSec=${stopSec}` : '';
+
+  return `[Unit]
+Description=NanoClaw Personal Assistant
+After=network.target${dockerOrdering}${wants}
+
+[Service]
+Type=simple
+ExecStart=${nodePath} ${projectRoot}/dist/index.js
+WorkingDirectory=${projectRoot}
+Restart=always
+RestartSec=5
+KillMode=process${timeoutStop}
+Environment=HOME=${homeDir}
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
+StandardOutput=append:${projectRoot}/logs/nanoclaw.log
+StandardError=append:${projectRoot}/logs/nanoclaw.error.log
+
+[Install]
+WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
+}
+
 function setupSystemd(
   projectRoot: string,
   nodePath: string,
@@ -233,24 +284,12 @@ function setupSystemd(
     systemctlPrefix = 'systemctl --user';
   }
 
-  const unit = `[Unit]
-Description=NanoClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-KillMode=process
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/nanoclaw.log
-StandardError=append:${projectRoot}/logs/nanoclaw.error.log
-
-[Install]
-WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
+  const unit = generateSystemdUnit(
+    nodePath,
+    projectRoot,
+    homeDir,
+    runningAsRoot,
+  );
 
   fs.writeFileSync(unitPath, unit);
   logger.info({ unitPath }, 'Wrote systemd unit');

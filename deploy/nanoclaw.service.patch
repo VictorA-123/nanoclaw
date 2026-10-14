@@ -1,5 +1,5 @@
 --- a/etc/systemd/system/nanoclaw.service (live, 2026-10-14)	2026-03-22 16:02:33.149157751 +0000
-+++ b/etc/systemd/system/nanoclaw.service (proposed)	2026-10-14 21:05:40.617216326 +0000
++++ b/etc/systemd/system/nanoclaw.service (proposed)	2026-10-14 21:32:33.825027013 +0000
 @@ -1,6 +1,7 @@
  [Unit]
  Description=NanoClaw Personal Assistant

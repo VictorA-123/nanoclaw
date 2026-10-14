@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from './config.js';
@@ -41,4 +42,28 @@ export function resolveGroupIpcPath(folder: string): string {
   const ipcPath = path.resolve(ipcBaseDir, folder);
   ensureWithinBase(ipcBaseDir, ipcPath);
   return ipcPath;
+}
+
+/**
+ * Ask a running container to wind down, by dropping the `_close` sentinel the
+ * agent-runner watches for. The container finishes what it is doing and exits
+ * instead of sitting in its IPC wait until IDLE_TIMEOUT (30 minutes).
+ *
+ * Shared by GroupQueue.closeStdin() and the shutdown drain. The drain cannot go
+ * through the queue: invocation-poller spawns never set the queue's `active`
+ * flag, so closeStdin() would silently return for exactly the runs the drain
+ * most needs to wind down.
+ *
+ * Returns false instead of throwing — a container that cannot be asked nicely
+ * is stopped at the bound anyway.
+ */
+export function writeCloseSentinel(folder: string): boolean {
+  try {
+    const inputDir = path.join(resolveGroupIpcPath(folder), 'input');
+    fs.mkdirSync(inputDir, { recursive: true });
+    fs.writeFileSync(path.join(inputDir, '_close'), '');
+    return true;
+  } catch {
+    return false;
+  }
 }

@@ -407,6 +407,9 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  // Scheduled-task id, when isScheduledTask. Carried for the drain report only
+  // — the container never reads it.
+  taskId?: string;
   assistantName?: string;
   runId?: string;
   // Kernel-resolved model pin. Absent => the container keeps its isMain default.
@@ -418,6 +421,51 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+}
+
+// --- Active-run registry (drain, follow-up (g)) ------------------------------
+// Populated inside runContainerAgent() itself, which is the ONLY place every
+// spawn path passes through: queue-driven messages (index.ts), scheduled tasks
+// (task-scheduler.ts) and kernel-mediated invocations (invocation-poller.ts).
+//
+// GroupQueue.activeCount is NOT a substitute: the invocation poller never goes
+// through runForGroup/runTask, so it never increments that counter. A drain
+// waiting on activeCount would happily exit with a live Sketch container.
+//
+// It also holds the run id, which otherwise lives only in a closure here, so
+// the drain can close a run it had to stop.
+
+export interface ActiveRun {
+  containerName: string;
+  group: RegisteredGroup;
+  chatJid: string;
+  agentId: string | null;
+  runIdPromise: Promise<string | null>;
+  isScheduledTask: boolean;
+  taskId: string | null;
+  startedAt: number;
+  // Set by the drain BEFORE it stops the container, so the close handler does
+  // not also emit a run_ended and leave the transcript with two endings.
+  closedByDrain: boolean;
+}
+
+const activeRuns = new Map<string, ActiveRun>();
+
+export function listActiveRuns(): ActiveRun[] {
+  return [...activeRuns.values()];
+}
+
+/** Marks a run as drain-closed. Returns false if it finished on its own first. */
+export function markClosedByDrain(containerName: string): boolean {
+  const run = activeRuns.get(containerName);
+  if (!run) return false;
+  run.closedByDrain = true;
+  return true;
+}
+
+/** @internal - for tests only. */
+export function _resetActiveRunsForTests(): void {
+  activeRuns.clear();
 }
 
 interface VolumeMount {
@@ -831,6 +879,20 @@ export async function runContainerAgent(
 
     onProcess(container, containerName);
 
+    // Visible to the drain from here until the close/error handler clears it.
+    const activeRun: ActiveRun = {
+      containerName,
+      group,
+      chatJid: input.chatJid,
+      agentId: emitAgentId ?? null,
+      runIdPromise,
+      isScheduledTask: input.isScheduledTask === true,
+      taskId: input.taskId ?? null,
+      startedAt: startTime,
+      closedByDrain: false,
+    };
+    activeRuns.set(containerName, activeRun);
+
     // Register the container's bridge IP with the credential proxy so it can
     // attribute Anthropic API calls to the right agent. The inspect runs
     // async; until it completes the first call or two may post with
@@ -983,6 +1045,7 @@ export async function runContainerAgent(
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      activeRuns.delete(containerName);
       if (registeredIp) {
         deregisterContainer(registeredIp);
         registeredIp = null;
@@ -993,7 +1056,12 @@ export async function runContainerAgent(
       // NOTE: this records a `run_ended` EVENT; the kernel has no run-completion
       // endpoint yet, so the runs row stays status:'started' — see the known
       // kernel-side gap documented in kernel-events.ts.
-      if (emitAgentId) {
+      //
+      // Skipped when the drain already closed this run with
+      // meta {"reason":"drain-timeout"}: the kernel would accept both (distinct
+      // idempotency keys) and the Q1 projection takes the first, but the
+      // transcript would show the run ending twice.
+      if (emitAgentId && !activeRun.closedByDrain) {
         runIdPromise
           .then((runId) => {
             if (runId) {
@@ -1206,6 +1274,7 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      activeRuns.delete(containerName);
       if (registeredIp) {
         deregisterContainer(registeredIp);
         registeredIp = null;

@@ -178,6 +178,8 @@ async function runTask(
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
+        // Carried only so a drain-timeout can name the task in its report.
+        taskId: task.id,
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) =>

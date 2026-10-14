@@ -1,9 +1,13 @@
+import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
+  DRAIN_POLL_MS,
+  DRAIN_SETTLE_MS,
+  DRAIN_TIMEOUT_MS,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   TIMEZONE,
@@ -17,6 +21,8 @@ import {
 } from './channels/registry.js';
 import {
   ContainerOutput,
+  listActiveRuns,
+  markClosedByDrain,
   runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -25,7 +31,13 @@ import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
   PROXY_BIND_HOST,
+  stopContainer,
 } from './container-runtime.js';
+import {
+  drainActiveRuns,
+  recordInterruptedRuns,
+  reportInterruptedRuns,
+} from './drain.js';
 import { reconcileOrphanedRuns } from './startup-reconcile.js';
 import {
   deleteSession,
@@ -44,7 +56,8 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, writeCloseSentinel } from './group-folder.js';
+import { emitEvent } from './kernel-events.js';
 import { startIpcWatcher } from './ipc.js';
 import { startInvocationPoller } from './invocation-poller.js';
 import { startSubagentAttributionPoller } from './subagent-attribution.js';
@@ -533,13 +546,60 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
-  // Graceful shutdown handlers
+  // Graceful shutdown: refuse new work, drain active runs within a bound, then
+  // stop. See docs/DRAIN_PLAN.md and src/drain.ts.
+  let draining = false;
   const shutdown = async (signal: string) => {
-    logger.info({ signal }, 'Shutdown signal received');
-    proxyServer.close();
-    await queue.shutdown(10000);
-    for (const ch of channels) await ch.disconnect();
-    process.exit(0);
+    if (draining) {
+      // Second signal means "I meant it" — skip the remaining wait.
+      logger.warn({ signal }, 'Second shutdown signal — exiting now');
+      process.exit(0);
+    }
+    draining = true;
+    logger.info(
+      { signal, boundMs: DRAIN_TIMEOUT_MS },
+      'Shutdown signal received — draining',
+    );
+
+    try {
+      // 1. Refuse new work. Containers already running keep running, and the
+      //    credential proxy STAYS UP: a draining agent makes fresh HTTP calls
+      //    to it constantly, so closing it first (as this handler used to)
+      //    would fail every run we are trying to let finish.
+      queue.beginDrain();
+
+      // 2. Wait, then stop whatever is left at the bound.
+      await drainActiveRuns({
+        listRuns: listActiveRuns,
+        markClosedByDrain,
+        stopContainer: (name) =>
+          new Promise<void>((resolve) => {
+            exec(stopContainer(name), { timeout: 15000 }, () => resolve());
+          }),
+        emitRunEnded: (runId, meta) =>
+          emitEvent(runId, 'run_ended', undefined, meta),
+        closeSentinel: writeCloseSentinel,
+        notify: async (chatJid, text) => {
+          const channel = findChannel(channels, chatJid);
+          // Internal agents (e.g. internal:sketch) own no channel — nothing to
+          // tell, and findChannel returning nothing is expected there.
+          if (!channel) return;
+          await channel.sendMessage(chatJid, text);
+        },
+        recordInterrupted: recordInterruptedRuns,
+        getQueueActiveCount: () => queue.getActiveCount(),
+        timeoutMs: DRAIN_TIMEOUT_MS,
+        settleMs: DRAIN_SETTLE_MS,
+        pollMs: DRAIN_POLL_MS,
+      });
+    } catch (err) {
+      // A drain bug must never wedge the shutdown and inherit a SIGKILL.
+      logger.error({ err }, 'Drain failed — stopping anyway');
+    } finally {
+      proxyServer.close();
+      for (const ch of channels) await ch.disconnect();
+      process.exit(0);
+    }
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
@@ -715,9 +775,15 @@ async function main(): Promise<void> {
     onProcess: (chatJid, proc, containerName, groupFolder) =>
       queue.registerProcess(chatJid, proc, containerName, groupFolder),
     isGroupActive: (chatJid) => queue.isActive(chatJid),
+    isShuttingDown: () => queue.isShuttingDown(),
   });
   startSubagentAttributionPoller();
   queue.setProcessMessagesFn(processGroupMessages);
+  // Say out loud what the previous drain had to cut off, BEFORE recovery runs:
+  // a drain-killed message run shows up here and then in the recovery log, and
+  // a drain-killed scheduled task shows up here only (it is deliberately not
+  // rescheduled — it resumes at its next scheduled slot).
+  reportInterruptedRuns();
   recoverPendingMessages();
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');

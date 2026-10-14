@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { writeCloseSentinel } from './group-folder.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -167,6 +168,12 @@ export class GroupQueue {
    * Returns true if the message was written, false if no active container.
    */
   sendMessage(groupJid: string, text: string): boolean {
+    // Drain (follow-up (g)): piping into a container we are about to stop would
+    // advance lastAgentTimestamp for a message that never gets answered. Say no
+    // instead; the caller then falls through to enqueueMessageCheck(), which
+    // no-ops while shutting down, so the message stays unconsumed and
+    // recoverPendingMessages() picks it up after the restart.
+    if (this.shuttingDown) return false;
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder || state.isTaskContainer)
       return false;
@@ -192,14 +199,7 @@ export class GroupQueue {
   closeStdin(groupJid: string): void {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder) return;
-
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
-    try {
-      fs.mkdirSync(inputDir, { recursive: true });
-      fs.writeFileSync(path.join(inputDir, '_close'), '');
-    } catch {
-      // ignore
-    }
+    writeCloseSentinel(state.groupFolder);
   }
 
   private async runForGroup(
@@ -353,22 +353,34 @@ export class GroupQueue {
     }
   }
 
-  async shutdown(_gracePeriodMs: number): Promise<void> {
+  /**
+   * Refuse new work. Everything already running keeps running — the waiting is
+   * the drain's job (see drain.ts and docs/DRAIN_PLAN.md).
+   *
+   * This REPLACES the old `shutdown()`, which logged
+   * "containers detached, not killed" and returned immediately. That detach
+   * bought nothing: the next process's cleanupOrphans() killed the very same
+   * containers seconds later (STATUS follow-up (g), 2026-08-11 and 2026-08-12).
+   */
+  beginDrain(): void {
     this.shuttingDown = true;
-
-    // Count active containers but don't kill them — they'll finish on their own
-    // via idle timeout or container timeout. The --rm flag cleans them up on exit.
-    // This prevents WhatsApp reconnection restarts from killing working agents.
-    const activeContainers: string[] = [];
-    for (const [_jid, state] of this.groups) {
-      if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
-      }
-    }
-
     logger.info(
-      { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      { activeCount: this.activeCount },
+      'GroupQueue refusing new work (drain started)',
     );
+  }
+
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
+  /** Queue-managed containers still running. Does NOT include poller spawns. */
+  getActiveCount(): number {
+    return this.activeCount;
+  }
+
+  /** @internal - for tests only. */
+  _resetShutdownForTests(): void {
+    this.shuttingDown = false;
   }
 }

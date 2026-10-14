@@ -1,11 +1,19 @@
 import { describe, it, expect } from 'vitest';
 import path from 'path';
 
+import { DEFAULT_DRAIN_TIMEOUT_MS } from '../src/config.js';
+import { generateSystemdUnit } from './service.js';
+
 /**
  * Tests for service configuration generation.
  *
  * These tests verify the generated content of plist/systemd/nohup configs
  * without actually loading services.
+ *
+ * The systemd unit is imported from service.ts, NOT re-declared here. It used
+ * to be a hand-copied duplicate, which meant a change to the real template
+ * (Phase 6 close-out Part C) could pass a green test suite while the installer
+ * silently kept writing the old unit.
  */
 
 // Helper: generate a plist string the same way service.ts does
@@ -44,32 +52,6 @@ function generatePlist(
     <string>${projectRoot}/logs/nanoclaw.error.log</string>
 </dict>
 </plist>`;
-}
-
-function generateSystemdUnit(
-  nodePath: string,
-  projectRoot: string,
-  homeDir: string,
-  isSystem: boolean,
-): string {
-  return `[Unit]
-Description=NanoClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-KillMode=process
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/nanoclaw.log
-StandardError=append:${projectRoot}/logs/nanoclaw.error.log
-
-[Install]
-WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
 }
 
 describe('plist generation', () => {
@@ -163,6 +145,54 @@ describe('systemd unit generation', () => {
     expect(unit).toContain(
       'ExecStart=/usr/bin/node /srv/nanoclaw/dist/index.js',
     );
+  });
+
+  // Phase 6 close-out, Part C. These three lines are the whole reason the
+  // template stopped being duplicated: the installer must keep writing them.
+  it('system unit orders itself after docker and wants it', () => {
+    const unit = generateSystemdUnit(
+      '/usr/bin/node',
+      '/root/nanoclaw',
+      '/root',
+      true,
+    );
+    expect(unit).toContain('After=network.target docker.service');
+    expect(unit).toContain('Wants=docker.service');
+  });
+
+  it('system unit sets TimeoutStopSec to the drain bound plus 30s', () => {
+    const unit = generateSystemdUnit(
+      '/usr/bin/node',
+      '/root/nanoclaw',
+      '/root',
+      true,
+    );
+    expect(unit).toContain(
+      `TimeoutStopSec=${DEFAULT_DRAIN_TIMEOUT_MS / 1000 + 30}`,
+    );
+  });
+
+  it('TimeoutStopSec follows a non-default drain bound', () => {
+    const unit = generateSystemdUnit(
+      '/usr/bin/node',
+      '/root/nanoclaw',
+      '/root',
+      true,
+      600_000,
+    );
+    expect(unit).toContain('TimeoutStopSec=630');
+  });
+
+  it('user unit gets no docker ordering — docker.service is not a user unit', () => {
+    const unit = generateSystemdUnit(
+      '/usr/bin/node',
+      '/home/user/nanoclaw',
+      '/home/user',
+      false,
+    );
+    expect(unit).toContain('After=network.target\n');
+    expect(unit).not.toContain('docker.service');
+    expect(unit).not.toContain('TimeoutStopSec');
   });
 });
 

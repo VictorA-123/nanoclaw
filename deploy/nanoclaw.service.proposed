@@ -30,25 +30,22 @@
 # 3. TimeoutStopSec=330 — the drain bound (NANOCLAW_DRAIN_TIMEOUT_MS, default
 #    300s) plus 30s of headroom, so systemd never SIGKILLs the process in the
 #    middle of its own drain. KEEP THESE TWO IN SYNC: if the drain bound is
-#    changed, this value must change with it. Drain itself is Part D and is
-#    NOT implemented yet — until it is, this unit only means "wait up to 330s
-#    for shutdown", which is harmless because today's shutdown returns in
-#    well under a second.
+#    changed, this value must change with it. Drain is implemented (Part D
+#    step 2 — src/drain.ts, docs/DRAIN_PLAN.md), so this value is load-bearing,
+#    not decorative: without it systemd kills the process at the default 90s,
+#    well inside the 300s wait.
 #
 # KillMode=process is deliberately unchanged: it keeps systemd from killing the
 # `docker run` children out from under the drain.
 #
-# DRIFT WARNING, left for the reviewer to rule on. The unit generator lives in
-# setup/service.ts (an inline template string), and setup/service.test.ts holds
-# a SECOND, hand-copied duplicate of that template. `npm run setup` rewrites
-# /etc/systemd/system/nanoclaw.service from the generator, so re-running setup
-# after installing this would silently drop all three lines below. Making the
-# change stick means editing the generator too — deliberately NOT done here,
-# because it also affects user-level systemd installs (where `docker.service`
-# is not a user unit) and fresh non-Linux installs. Options:
-#   (a) leave as is and treat `npm run setup` as a known re-break;
-#   (b) add the three lines to the generator behind the existing isSystem flag,
-#       and de-duplicate the template the test copies.
+# DRIFT: RESOLVED. The generator in setup/service.ts now emits these three
+# lines itself (behind its existing isSystem flag, so a user-level unit still
+# gets none of them — `docker.service` is not a user unit). `npm run setup` no
+# longer silently reverts them, and setup/service.test.ts asserts against the
+# real template instead of the hand-copied duplicate it used to hold.
+#
+# That makes this file a review aid, not the source of truth. If you edit the
+# unit, edit generateSystemdUnit() in setup/service.ts and regenerate.
 
 [Unit]
 Description=NanoClaw Personal Assistant

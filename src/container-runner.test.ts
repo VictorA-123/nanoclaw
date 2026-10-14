@@ -89,7 +89,20 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+// Kernel event emission is reporting-only; stub it so nothing reaches :4100.
+vi.mock('./kernel-events.js', () => ({
+  emitRunStarted: vi.fn(async () => 'run:test'),
+  emitEvent: vi.fn(async () => {}),
+}));
+
+import {
+  runContainerAgent,
+  ContainerOutput,
+  listActiveRuns,
+  markClosedByDrain,
+  _resetActiveRunsForTests,
+} from './container-runner.js';
+import { emitEvent } from './kernel-events.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -209,5 +222,115 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+// Drain, follow-up (g). The registry lives in runContainerAgent() because that
+// is the only place EVERY spawn path goes through — GroupQueue.activeCount
+// misses invocation-poller spawns entirely.
+describe('active-run registry', () => {
+  const mappedGroup: RegisteredGroup = {
+    name: 'Jammer',
+    folder: 'whatsapp_main',
+    trigger: '',
+    added_at: new Date().toISOString(),
+    isMain: true,
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    _resetActiveRunsForTests();
+    vi.mocked(emitEvent).mockClear();
+    // Keep definition-fetch off the network: it falls through to legacy-local.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('no kernel in tests');
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('registers a run while it is live and clears it on close', async () => {
+    const p = runContainerAgent(testGroup, testInput, () => {});
+    await vi.advanceTimersByTimeAsync(10);
+
+    const live = listActiveRuns();
+    expect(live).toHaveLength(1);
+    expect(live[0].group.folder).toBe('test-group');
+    expect(live[0].chatJid).toBe('test@g.us');
+    expect(live[0].closedByDrain).toBe(false);
+
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await p;
+
+    expect(listActiveRuns()).toEqual([]);
+  });
+
+  it('carries the scheduled-task id so a drain report can name it', async () => {
+    const p = runContainerAgent(
+      testGroup,
+      { ...testInput, isScheduledTask: true, taskId: 'task-7' },
+      () => {},
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(listActiveRuns()[0]).toMatchObject({
+      isScheduledTask: true,
+      taskId: 'task-7',
+    });
+
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await p;
+  });
+
+  it('emits run_ended normally when the run closes on its own', async () => {
+    const p = runContainerAgent(mappedGroup, testInput, () => {});
+    await vi.advanceTimersByTimeAsync(10);
+
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await p;
+
+    expect(
+      vi.mocked(emitEvent).mock.calls.filter((c) => c[1] === 'run_ended'),
+    ).toHaveLength(1);
+  });
+
+  it('suppresses its own run_ended once the drain has closed the run', async () => {
+    const p = runContainerAgent(mappedGroup, testInput, () => {});
+    await vi.advanceTimersByTimeAsync(10);
+
+    const [run] = listActiveRuns();
+    expect(markClosedByDrain(run.containerName)).toBe(true);
+
+    fakeProc.emit('close', 137);
+    await vi.advanceTimersByTimeAsync(10);
+    await p;
+
+    // The drain emitted the drain-timeout run_ended itself; a second one here
+    // would make the transcript show the run ending twice.
+    expect(
+      vi.mocked(emitEvent).mock.calls.filter((c) => c[1] === 'run_ended'),
+    ).toHaveLength(0);
+  });
+
+  it('markClosedByDrain reports false for a run that already finished', async () => {
+    const p = runContainerAgent(testGroup, testInput, () => {});
+    await vi.advanceTimersByTimeAsync(10);
+    const [run] = listActiveRuns();
+
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await p;
+
+    expect(markClosedByDrain(run.containerName)).toBe(false);
   });
 });

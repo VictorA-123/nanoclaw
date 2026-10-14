@@ -58,6 +58,31 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
 );
 
+// --- Drain on shutdown (FABLE follow-up (g), see docs/DRAIN_PLAN.md) ---------
+// On SIGTERM we refuse new work and wait a BOUNDED time for active runs to
+// finish before stopping. The bound is the only tunable knob.
+//
+// The systemd unit's TimeoutStopSec must be this plus headroom, or systemd
+// SIGKILLs us mid-drain and the whole mechanism is pointless. setup/service.ts
+// derives it from DEFAULT_DRAIN_TIMEOUT_MS — if you change the default here,
+// the generated unit follows, but an ALREADY-INSTALLED unit does not. Change
+// both.
+export const DEFAULT_DRAIN_TIMEOUT_MS = 300_000;
+export const DRAIN_TIMEOUT_MS = Math.max(
+  0,
+  parseInt(
+    process.env.NANOCLAW_DRAIN_TIMEOUT_MS || String(DEFAULT_DRAIN_TIMEOUT_MS),
+    10,
+  ) || DEFAULT_DRAIN_TIMEOUT_MS,
+);
+// After the bound we stop the containers, then give their awaiting callers a
+// moment to run their own bookkeeping — the message-cursor rollback in
+// processGroupMessages, and updateTaskAfterRun for a scheduled task. Not
+// configurable: it is a settle window, not a policy.
+export const DRAIN_SETTLE_MS = 10_000;
+// How often the drain re-checks whether every run has finished.
+export const DRAIN_POLL_MS = 250;
+
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
