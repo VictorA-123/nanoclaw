@@ -1,0 +1,21 @@
+# PROPOSED nanoclaw-restart-debt.timer — NOT INSTALLED.
+#
+# Phase 6 close-out, Part E. Daily, per ruling 2-5 ("a root systemd timer on
+# the host runs `needrestart -b` (batch mode) daily").
+
+[Unit]
+Description=Daily NanoClaw restart-debt probe
+Documentation=file:///opt/agent-os/docs/FABLE_RULING_BACKUPS_RESTARTS_2026-10-06.md
+
+[Timer]
+# Daily at 05:30, deliberately after the 04:00 nightly backup cron so the two
+# never contend. RandomizedDelaySec keeps it off the exact minute boundary.
+OnCalendar=*-*-* 05:30:00
+RandomizedDelaySec=15m
+# Run on next boot if the box was off when the timer was due — debt age is only
+# meaningful if the probe actually reports.
+Persistent=true
+Unit=nanoclaw-restart-debt.service
+
+[Install]
+WantedBy=timers.target

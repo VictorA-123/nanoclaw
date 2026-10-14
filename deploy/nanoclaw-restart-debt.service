@@ -1,0 +1,41 @@
+# PROPOSED nanoclaw-restart-debt.service — NOT INSTALLED.
+#
+# Phase 6 close-out, Part E. Reference copy for review; nothing installs it.
+# Paired with nanoclaw-restart-debt.timer — this unit has no [Install] section
+# because the timer is what gets enabled.
+#
+# To install (deliberate step, no nanoclaw restart needed — this touches
+# neither nanoclaw.service nor any container):
+#   cp deploy/nanoclaw-restart-debt.service /etc/systemd/system/
+#   cp deploy/nanoclaw-restart-debt.timer   /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now nanoclaw-restart-debt.timer
+#   systemctl start nanoclaw-restart-debt.service   # one probe now
+#   curl -s http://127.0.0.1:4100/system-health | jq .
+
+[Unit]
+Description=NanoClaw restart-debt probe (needrestart -> kernel system_health)
+Documentation=file:///opt/agent-os/docs/FABLE_RULING_BACKUPS_RESTARTS_2026-10-06.md
+# The probe PUTs over loopback to the kernel. Wants, not Requires: if the
+# kernel is down the probe exits 1, the failure is visible in the journal, and
+# the next run reports the same debt with a correct age.
+After=network-online.target agent-os-kernel.service
+Wants=agent-os-kernel.service
+
+[Service]
+Type=oneshot
+# Root is required: non-root needrestart only sees the caller's own processes,
+# so the service list would be quietly short rather than obviously wrong.
+User=root
+ExecStart=/root/nanoclaw/scripts/needrestart-probe.sh
+TimeoutStartSec=180
+# Read-only everywhere except its own state file. The probe never opens
+# kernel.db — it writes through the kernel API, preserving the sole-writer rule.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Creates and grants write access to /var/lib/nanoclaw, which is the probe's
+# default state path (RESTART_DEBT_STATE). No other writable path is needed.
+StateDirectory=nanoclaw
+StandardOutput=journal
+StandardError=journal
